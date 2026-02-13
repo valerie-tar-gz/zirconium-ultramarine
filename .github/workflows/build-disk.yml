@@ -1,0 +1,104 @@
+---
+name: Build disk image
+on:
+  schedule:
+    - cron: "0 1 * * TUE"
+  workflow_dispatch:
+
+jobs:
+  build_release:
+    name: Build and release disk image
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["amd64", "arm64"]
+        flavor: ["", "-nvidia"]
+    runs-on: ${{ matrix.platform == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          submodules: true
+
+      - name: Maximize build space
+        if: inputs.platform != 'arm64'
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
+        with:
+          remove-codeql: true
+
+      - name: Build ISO
+        id: build-iso
+        uses: osbuild/bootc-image-builder-action@main
+        with:
+          config-file: ${{ matrix.flavor == '-nvidia' && './iso-nvidia.toml' || './iso.toml' }}
+          image: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}${{ matrix.flavor }}:latest
+          types: anaconda-iso
+          rootfs: btrfs
+          additional-args: --use-librepo=True
+
+      - name: Upload Artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: ${{ github.event.repository.name }}-${{ matrix.platform }}
+          path: ${{ steps.build-iso.outputs.output-directory }}
+          if-no-files-found: error
+          retention-days: 0
+          compression-level: 0
+          overwrite: true
+
+      - name: Brand ISOs
+        env:
+          FLAVOR: ${{ matrix.flavor }}
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE_NAME: "${{ github.event.repository.name }}"
+          SOURCE_DIR: ${{ steps.build-iso.outputs.output-directory }}
+        run: |
+          sudo mv "${SOURCE_DIR}"/*/*.iso "${SOURCE_DIR}/zirc-unbranded.iso"
+          sudo podman rmi -a -f
+          podman rmi -a -f
+          sudo podman run \
+            --rm \
+            -it \
+            --pull=newer \
+            --privileged \
+            -v /dev:/dev \
+            -v "${SOURCE_DIR}:/output" \
+            -v ./assets/iso:/iso \
+            registry.fedoraproject.org/fedora:latest \
+            bash -c 'dnf install -y lorax \
+            && mkdir /images \
+            && cd /iso/product && find . | cpio -c -o | gzip -9cv > /images/product.img && cd / \
+            && mkksiso \
+                --add /images \
+                --volid zirconium-boot \
+                --replace "vmlinuz" "vmlinuz inst.resolution=1280x800" \
+                /output/zirc-unbranded.iso \
+                /output/zirc.iso'
+          sudo mv "${SOURCE_DIR}"/zirc.iso "${SOURCE_DIR}/${IMAGE_NAME}${FLAVOR}-${PLATFORM}.iso"
+          sha256sum "${SOURCE_DIR}/${IMAGE_NAME}${FLAVOR}-${PLATFORM}.iso" | sudo tee "${SOURCE_DIR}/${IMAGE_NAME}${FLAVOR}-${PLATFORM}.iso-CHECKSUM"
+          sudo rm -f "${SOURCE_DIR}/zirc-unbranded.iso"
+
+      - name: Upload to S3
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        shell: bash
+        env:
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          RCLONE_CONFIG_S3_PROVIDER: ${{ secrets.S3_PROVIDER }}
+          RCLONE_CONFIG_S3_REGION: ${{ secrets.S3_REGION }}
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_S3_TYPE: s3
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          SOURCE_DIR: ${{ steps.build-iso.outputs.output-directory }}
+        run: |
+          sudo apt update -y
+          sudo apt install -y rclone
+          rclone copy "${SOURCE_DIR}"/*.iso "S3:${S3_BUCKET_NAME}"
+          rclone copy "${SOURCE_DIR}"/*.iso-CHECKSUM "S3:${S3_BUCKET_NAME}"
