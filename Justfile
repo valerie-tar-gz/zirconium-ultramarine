@@ -39,9 +39,9 @@ bootc *ARGS:
 disk-image $filesystem=filesystem:
     #!/usr/bin/env bash
     if [ ! -e "${BUILD_BASE_DIR:-.}/bootable.img" ] ; then
-        fallocate -l 20G /var/home/v/zirconium/bootable.img
+        fallocate -l 20G "${BUILD_BASE_DIR:-.}/bootable.img"
     fi
-    just bootc install to-disk --via-loopback /var/home/v/zirconium/bootable.img --filesystem "${filesystem}" --wipe
+    just bootc install to-disk --via-loopback /data/bootable.img --filesystem "${filesystem}" --wipe
 
 quick-iterate:
     #!/usr/bin/env bash
